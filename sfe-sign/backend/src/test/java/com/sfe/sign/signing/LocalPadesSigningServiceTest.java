@@ -13,7 +13,7 @@ class LocalPadesSigningServiceTest {
         properties.setAgentUrl("http://127.0.0.1:12345");
         properties.setAgentSessionSecret("test-session-secret");
         return new LocalPadesSigningService(
-                properties, new LocalSigningStore(), new LocalAgentClient(properties));
+                properties, new LocalSigningStore(), new LocalAgentClient(properties), null);
     }
 
     @Test
@@ -39,7 +39,7 @@ class LocalPadesSigningServiceTest {
     void requiresAnAgentSessionBeforeAcceptingAValidPdf() {
         SigningProperties properties = new SigningProperties();
         LocalPadesSigningService service = new LocalPadesSigningService(
-                properties, new LocalSigningStore(), new LocalAgentClient(properties));
+                properties, new LocalSigningStore(), new LocalAgentClient(properties), null);
         MockMultipartFile file = new MockMultipartFile(
                 "file", "test.pdf", "application/pdf", "%PDF-1.7".getBytes());
 

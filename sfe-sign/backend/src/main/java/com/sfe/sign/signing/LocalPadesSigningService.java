@@ -17,12 +17,15 @@ public class LocalPadesSigningService {
     private final SigningProperties properties;
     private final LocalSigningStore store;
     private final LocalAgentClient localAgentClient;
+    private final SignedPdfValidationService validationService;
 
     public LocalPadesSigningService(
-            SigningProperties properties, LocalSigningStore store, LocalAgentClient localAgentClient) {
+            SigningProperties properties, LocalSigningStore store, LocalAgentClient localAgentClient,
+            SignedPdfValidationService validationService) {
         this.properties = properties;
         this.store = store;
         this.localAgentClient = localAgentClient;
+        this.validationService = validationService;
     }
 
     public PreflightResponse preflight(MultipartFile file) {
@@ -47,8 +50,8 @@ public class LocalPadesSigningService {
             LocalSigningOperation operation = store.take(operationId);
             if (operation == null) throw new IllegalArgumentException("Unknown or expired signing operation.");
             byte[] result = localAgentClient.sign(operation);
-            store.complete(operationId, result, new ValidationReport(operationId, "COMPLETED", "PAdES_BASELINE_LT",
-                    "The local agent completed the requested LT signing flow. Download is available."));
+            ValidationReport report = validationService.validate(operationId, result);
+            store.complete(operationId, result, report);
         } catch (Exception exception) {
             throw new IllegalStateException("PAdES Baseline LT signing failed; no signed PDF is available: "
                     + exception.getMessage(), exception);

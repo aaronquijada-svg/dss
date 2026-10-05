@@ -11,14 +11,20 @@ public class SigningService {
 
     private final SigningProvider mockSigningProvider;
     private final SigningProvider safeSignProvider;
+    private final SigningProvider localAgentSigningProvider;
+    private final LocalAgentClient localAgentClient;
     private final SigningProperties properties;
 
     public SigningService(
             MockSigningProvider mockSigningProvider,
             SafeSignProvider safeSignProvider,
+            LocalAgentSigningProvider localAgentSigningProvider,
+            LocalAgentClient localAgentClient,
             SigningProperties properties) {
         this.mockSigningProvider = mockSigningProvider;
         this.safeSignProvider = safeSignProvider;
+        this.localAgentSigningProvider = localAgentSigningProvider;
+        this.localAgentClient = localAgentClient;
         this.properties = properties;
     }
 
@@ -32,6 +38,9 @@ public class SigningService {
     }
 
     private SigningProvider selectedProvider() {
+        if (localAgentClient.configured()) {
+            return localAgentSigningProvider;
+        }
         return properties.getSigningProvider() == SigningProperties.SigningProviderType.SAFESIGN
                 ? safeSignProvider
                 : mockSigningProvider;

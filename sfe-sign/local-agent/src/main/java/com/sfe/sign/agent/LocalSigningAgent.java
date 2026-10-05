@@ -22,6 +22,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.security.KeyStore.PasswordProtection;
 import java.security.SecureRandom;
 import java.util.Arrays;
@@ -29,12 +32,16 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.swing.JPasswordField;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 
 public final class LocalSigningAgent {
     private static final String SESSION_HEADER = "X-SFE-Agent-Session";
+    private static final ThreadLocal<String> CURRENT_STAGE = new ThreadLocal<>();
+    private static final Logger LOGGER = Logger.getLogger(LocalSigningAgent.class.getName());
     private final AgentConfiguration configuration;
     private final String sessionSecret;
 
@@ -77,24 +84,33 @@ public final class LocalSigningAgent {
         }
         byte[] sourceBytes = exchange.getRequestBody().readAllBytes();
         try {
+            status("waiting for local approval");
             byte[] signed = signWithExplicitDesktopApproval(sourceBytes, exchange.getRequestHeaders().getFirst("X-SFE-Document-Name"));
             write(exchange, 200, "application/pdf", signed);
         } catch (UserCancelledException exception) {
-            write(exchange, 409, "text/plain", "Local user cancelled PIN confirmation; no signing occurred.".getBytes(StandardCharsets.UTF_8));
+            writeError(exchange, 409, "USER_CANCELLED", currentStage());
+        } catch (AgentOperationException exception) {
+            writeError(exchange, 422, exception.code(), currentStage());
         } catch (Exception exception) {
-            write(exchange, 422, "text/plain", "Local agent could not complete PAdES Baseline LT; no signed PDF is available."
-                    .getBytes(StandardCharsets.UTF_8));
+            LOGGER.log(Level.WARNING, "Local signing operation failed during " + currentStage(), exception);
+            writeError(exchange, 422, "AGENT_OPERATION_FAILED", currentStage());
         } finally {
             Arrays.fill(sourceBytes, (byte) 0);
+            CURRENT_STAGE.remove();
         }
     }
 
     private byte[] signWithExplicitDesktopApproval(byte[] sourceBytes, String fileName) throws Exception {
         char[] pin = requestPinWithApproval();
         try {
-            try (Pkcs11SignatureToken token = new Pkcs11SignatureToken(
-                    configuration.pkcs11LibraryPath(), new PasswordProtection(pin), configuration.pkcs11Slot())) {
-                List<DSSPrivateKeyEntry> keys = token.getKeys();
+            status("opening SafeSign PKCS#11");
+            try (Pkcs11SignatureToken token = createPkcs11Token(pin)) {
+                List<DSSPrivateKeyEntry> keys;
+                try {
+                    keys = token.getKeys();
+                } catch (Exception | LinkageError exception) {
+                    throw pkcs11Failure(exception);
+                }
                 if (keys.isEmpty()) throw new IllegalStateException("No signing key is available.");
                 DSSPrivateKeyEntry key = keys.get(0);
                 DSSDocument source = new InMemoryDocument(sourceBytes, safeName(fileName));
@@ -109,7 +125,9 @@ public final class LocalSigningAgent {
                 parameters.setSigningCertificate(key.getCertificate());
                 parameters.setCertificateChain(key.getCertificateChain());
                 ToBeSigned data = service.getDataToSign(source, parameters);
+                status("creating the PKCS#11 signature");
                 SignatureValue value = token.sign(data, DigestAlgorithm.SHA256, key);
+                status("requesting TSA and revocation data for PAdES LT");
                 DSSDocument signed = service.signDocument(source, parameters, value);
                 ByteArrayOutputStream output = new ByteArrayOutputStream();
                 signed.writeTo(output);
@@ -118,6 +136,15 @@ public final class LocalSigningAgent {
             }
         } finally {
             Arrays.fill(pin, '\0');
+        }
+    }
+
+    private Pkcs11SignatureToken createPkcs11Token(char[] pin) throws AgentOperationException {
+        try {
+            return new Pkcs11SignatureToken(configuration.pkcs11LibraryPath(), new PasswordProtection(pin),
+                    configuration.pkcs11SlotId(), configuration.pkcs11ExtraConfig());
+        } catch (Exception | LinkageError exception) {
+            throw pkcs11Failure(exception);
         }
     }
 
@@ -170,7 +197,40 @@ public final class LocalSigningAgent {
         exchange.close();
     }
 
-    private record AgentConfiguration(String pkcs11LibraryPath, String tsaUrl, int pkcs11Slot) {
+    private void writeError(HttpExchange exchange, int status, String code, String stage) throws IOException {
+        exchange.getResponseHeaders().set("X-SFE-Agent-Stage", stage);
+        exchange.getResponseHeaders().set("X-SFE-Agent-Error-Code", code);
+        write(exchange, status, "application/json",
+                ("{\"code\":\"" + code + "\",\"stage\":\"" + stage + "\"}").getBytes(StandardCharsets.UTF_8));
+    }
+
+    private AgentOperationException pkcs11Failure(Throwable exception) {
+        LOGGER.log(Level.WARNING, "SafeSign PKCS#11 initialization failed. "
+                + "Review this local-agent console for middleware diagnostics.", exception);
+        String diagnostic = String.valueOf(exception.getMessage()).toLowerCase(java.util.Locale.ROOT);
+        if (exception instanceof UnsatisfiedLinkError || diagnostic.contains("loadlibrary")
+                || diagnostic.contains("can't load") || diagnostic.contains("cannot load")) {
+            return new AgentOperationException("PKCS11_LIBRARY_UNAVAILABLE");
+        }
+        if (diagnostic.contains("slot") || diagnostic.contains("token not present")
+                || diagnostic.contains("token_not_present")) {
+            return new AgentOperationException("PKCS11_SLOT_UNAVAILABLE");
+        }
+        return new AgentOperationException("PKCS11_PROVIDER_INITIALIZATION_FAILED");
+    }
+
+    private static void status(String stage) {
+        CURRENT_STAGE.set(stage);
+        System.out.println("SFE agent stage: " + stage);
+    }
+
+    private static String currentStage() {
+        String stage = CURRENT_STAGE.get();
+        return stage == null ? "an unspecified local-agent stage" : stage;
+    }
+
+    private record AgentConfiguration(String pkcs11LibraryPath, String tsaUrl, int pkcs11SlotId,
+                                      Integer pkcs11SlotListIndex) {
         static AgentConfiguration fromEnvironment() {
             Map<String, String> environment = System.getenv();
             String library = environment.get("SFE_SIGN_AGENT_PKCS11_LIBRARY_PATH");
@@ -178,9 +238,38 @@ public final class LocalSigningAgent {
             if (library == null || library.isBlank() || !validTsaUri(tsa)) {
                 throw new IllegalStateException("Set SFE_SIGN_AGENT_PKCS11_LIBRARY_PATH and SFE_SIGN_AGENT_TSA_URL.");
             }
+            try {
+                if (!Files.isRegularFile(Path.of(library))) {
+                    throw new IllegalStateException("The configured SafeSign PKCS#11 library is not a readable file.");
+                }
+            } catch (InvalidPathException exception) {
+                throw new IllegalStateException("The configured SafeSign PKCS#11 library path is invalid.", exception);
+            }
 
-            return new AgentConfiguration(library, tsa,
-                    Integer.parseInt(environment.getOrDefault("SFE_SIGN_AGENT_PKCS11_SLOT", "0")));
+            Integer slotId = nonNegativeEnvironmentInteger(environment, "SFE_SIGN_AGENT_PKCS11_SLOT");
+            Integer slotListIndex = nonNegativeEnvironmentInteger(environment, "SFE_SIGN_AGENT_PKCS11_SLOT_LIST_INDEX");
+            if (slotId != null && slotListIndex != null) {
+                throw new IllegalStateException("Set only one of SFE_SIGN_AGENT_PKCS11_SLOT or "
+                        + "SFE_SIGN_AGENT_PKCS11_SLOT_LIST_INDEX.");
+            }
+
+            return new AgentConfiguration(library, tsa, slotId == null ? -1 : slotId, slotListIndex);
+        }
+
+        String pkcs11ExtraConfig() {
+            return pkcs11SlotListIndex == null ? null : "slotListIndex = " + pkcs11SlotListIndex;
+        }
+
+        private static Integer nonNegativeEnvironmentInteger(Map<String, String> environment, String name) {
+            String value = environment.get(name);
+            if (value == null || value.isBlank()) return null;
+            try {
+                int parsed = Integer.parseInt(value);
+                if (parsed < 0) throw new NumberFormatException();
+                return parsed;
+            } catch (NumberFormatException exception) {
+                throw new IllegalStateException(name + " must be a non-negative integer.", exception);
+            }
         }
 
         private static boolean validTsaUri(String value) {
@@ -195,5 +284,17 @@ public final class LocalSigningAgent {
     }
 
     private static final class UserCancelledException extends Exception {
+    }
+
+    private static final class AgentOperationException extends Exception {
+        private final String code;
+
+        private AgentOperationException(String code) {
+            this.code = code;
+        }
+
+        private String code() {
+            return code;
+        }
     }
 }

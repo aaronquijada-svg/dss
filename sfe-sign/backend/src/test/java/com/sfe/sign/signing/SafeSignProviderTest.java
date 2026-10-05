@@ -36,4 +36,17 @@ class SafeSignProviderTest {
         assertThat(capabilities.pkcs11LibraryAvailable()).isFalse();
         assertThat(capabilities.pkcs11ModuleReady()).isFalse();
     }
+
+    @Test
+    void reportsTheLocalAgentAsTheConfiguredSafeSignProvider() {
+        SigningProperties properties = new SigningProperties();
+        properties.setAgentUrl("http://127.0.0.1:12345");
+        properties.setAgentSessionSecret("ephemeral-session-secret");
+
+        SigningCapabilities capabilities = new LocalAgentSigningProvider(new LocalAgentClient(properties)).capabilities();
+
+        assertThat(capabilities.provider()).isEqualTo("SafeSign PKCS#11 (local agent)");
+        assertThat(capabilities.providerConfigured()).isTrue();
+        assertThat(capabilities.pkcs11ModuleReady()).isFalse();
+    }
 }

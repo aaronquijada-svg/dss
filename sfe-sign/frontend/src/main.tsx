@@ -20,6 +20,7 @@ function App() {
   const [message, setMessage] = useState<string>();
   const [preflight, setPreflight] = useState<import("./api").PreflightResponse>();
   const [report, setReport] = useState<import("./api").ValidationReport>();
+  const [isSigning, setIsSigning] = useState(false);
 
   useEffect(() => {
     signingApi.capabilities().then(setCapabilities).catch(() => {
@@ -50,12 +51,16 @@ function App() {
   }
   async function confirm() {
     if (!preflight) return;
+    setIsSigning(true);
+    setMessage("Waiting for approval and secure processing in the local signing agent. Check the agent window for the current stage.");
     try {
       const result = await signingApi.confirm(preflight.operationId);
       setMessage(result.detail);
       setReport(await signingApi.report(preflight.operationId));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Signing failed. No signed PDF was made available.");
+    } finally {
+      setIsSigning(false);
     }
   }
 
@@ -87,7 +92,9 @@ function App() {
           <p><strong>{preflight.documentName}</strong> — {preflight.sizeBytes} bytes</p>
           <p>SHA-256: <code>{preflight.sha256}</code></p>
           <p>{preflight.confirmationNotice}</p>
-          <button type="button" onClick={confirm}>Confirm and sign locally</button>
+          <button type="button" onClick={confirm} disabled={isSigning}>
+            {isSigning ? "Signing in local agent…" : "Confirm and sign locally"}
+          </button>
         </div>}
         {report && <p className="notice">Validation: {report.status} ({report.signatureLevel}). {report.detail}</p>}
         {preflight && report && <a href={`/api/v1/signatures/${preflight.operationId}/download`}>Download signed PDF</a>}
